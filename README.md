@@ -8,6 +8,7 @@
 
 ## 核心特性
 
+- **完整支持标准 OIDC Discovery**：**只需配置主域名（Issuer）**，插件全自动通过 `/.well-known/openid-configuration` 动态发现并解析授权端点、令牌端点与用户信息端点，免去繁琐配置。
 - **原生微内核接入**：完全基于 Hydro 的 Cordis 架构与 `oauth.provide` 标准规范开发，与 Hydro 原生登录体系完美融合。
 - **一键秒进首页（免确认密码）**：用户首次授权即可自动创建系统用户并直接登录，跳过传统需要手动输入密码的二次注册确认流程。
 - **关键权限自动补齐**：自动为新用户授予 `PRIV.PRIV_USER_PROFILE`（数值为 `4`），杜绝因权限缺失被系统自动降级为 `guest` 并清理 session 的暗坑。
@@ -26,6 +27,10 @@ sequenceDiagram
     participant Hydro as Hydro OJ (前端/后端)
     participant Addon as hydro-addon
     participant OAA as SUSE OAA 统一认证中心
+
+    Note over Addon,OAA: 启动/首次请求：通过 OIDC Discovery 获取全部端点
+    Addon->>OAA: GET /.well-known/openid-configuration
+    OAA-->>Addon: 返回 authorization_endpoint, token_endpoint, userinfo_endpoint
 
     User->>Hydro: 点击「OAA统一身份认证」大按钮
     Hydro->>Addon: 触发 Provider get() 逻辑
@@ -163,17 +168,18 @@ nginx -t && nginx -s reload
 - 回调地址 `redirect_uri` 将基于该配置生成：`https://oj.suse.edu.cn/oauth/suseoaa/callback`。
 
 ### 2. 插件后台配置项说明
-进入 **控制面板** -> **SUSE OAA** 配置分组，可根据需要随时热调整参数：
+进入 **控制面板** -> **SUSE OAA** 配置分组，**日常只需关注前三项即可**：
 
 | 配置键名 | 默认值 | 类型 | 说明 |
 | :--- | :--- | :--- | :--- |
+| `suseoaa.issuer` | `https://v2-api.suseoaa.com` | text | **统一认证主域名 (Issuer)**，填入主域名后自动进行 OIDC 发现 |
 | `suseoaa.client_id` | `suse_oj` | text | SUSE OAA OAuth2 客户端标识 |
 | `suseoaa.client_secret` | `oaa_sec_...` | text (秘文) | SUSE OAA OAuth2 客户端密钥 |
-| `suseoaa.authorize_url` | `https://v2-api.suseoaa.com/v2/oauth/authorize` | text | 认证中心授权跳转端点 |
-| `suseoaa.token_url` | `https://v2-api.suseoaa.com/v2/oauth/token` | text | 令牌发放端点 |
-| `suseoaa.userinfo_url` | `https://v2-api.suseoaa.com/v2/oauth/userinfo` | text | 用户身份信息端点 |
 | `suseoaa.scope` | `openid profile email` | text | 申请的 OAuth 作用域 |
 | `suseoaa.auto_register` | `true` | text | 是否开启免确认静默自动开号 |
+| `suseoaa.authorize_url` | *(留空)* | text | 【高级选填】覆盖自动发现的授权端点（留空即可） |
+| `suseoaa.token_url` | *(留空)* | text | 【高级选填】覆盖自动发现的令牌端点（留空即可） |
+| `suseoaa.userinfo_url` | *(留空)* | text | 【高级选填】覆盖自动发现的用户信息端点（留空即可） |
 
 ---
 

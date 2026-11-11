@@ -2,11 +2,12 @@
  * Hydro OJ v5.x 原生单点登录插件 (Addon) - SUSE OAA 统一身份认证
  * 
  * 功能特性：
- * 1. 原生注册 OAuth2 / OIDC 提供者（suseoaa），在登录弹窗与 /login 页面原生渲染「OAA统一身份认证」大按钮；
- * 2. 自动生成并校验防重放安全 State 令牌（TokenModel.TYPE_OAUTH）；
- * 3. 换取访问令牌并拉取 OAA 用户信息（姓名、学号、邮箱、唯一 sub）；
- * 4. 支持「一键秒进首页」静默无感自动开号与账号绑定，自动补齐 PRIV_USER_PROFILE 权限；
- * 5. 后台控制面板配置项注入（严格使用 'text' 规范类型，防止 HTML 模板报错）。
+ * 1. 支持标准 OIDC Discovery 协议：只需填写主域名（Issuer），插件全自动通过 /.well-known/openid-configuration 发现授权、令牌、用户信息端点；
+ * 2. 原生注册 OAuth2 / OIDC 提供者（suseoaa），在登录弹窗与 /login 页面原生渲染「OAA统一身份认证」大按钮；
+ * 3. 自动生成并校验防重放安全 State 令牌（TokenModel.TYPE_OAUTH）；
+ * 4. 换取访问令牌并拉取 OAA 用户信息（姓名、学号、邮箱、唯一 sub）；
+ * 5. 支持「一键秒进首页」静默无感自动开号与账号绑定，自动补齐 PRIV_USER_PROFILE 权限；
+ * 6. 后台控制面板配置项注入（严格使用 'text' 规范类型，防止 HTML 模板报错）。
  */
 
 const crypto = require('crypto');
@@ -14,11 +15,9 @@ const crypto = require('crypto');
 // 统一认证中心默认常量配置
 const PROVIDER_NAME = 'suseoaa';
 const PROVIDER_TEXT = 'OAA统一身份认证';
+const DEFAULT_ISSUER = 'https://v2-api.suseoaa.com';
 const DEFAULT_CLIENT_ID = 'suse_oj';
 const DEFAULT_CLIENT_SECRET = 'oaa_sec_e844df546971b247c38794f18735bc0d';
-const DEFAULT_AUTH_URL = 'https://v2-api.suseoaa.com/v2/oauth/authorize';
-const DEFAULT_TOKEN_URL = 'https://v2-api.suseoaa.com/v2/oauth/token';
-const DEFAULT_USERINFO_URL = 'https://v2-api.suseoaa.com/v2/oauth/userinfo';
 const DEFAULT_SCOPE = 'openid profile email';
 
 // 学位帽 / 统一认证图标 (SVG)
@@ -27,6 +26,68 @@ const ICON_GRADUATION_CAP = `
   <path d="M12 3L1 9l11 6 9-4.91V17h2V9L12 3zM5 13.18v4L12 21l7-3.82v-4L12 17l-7-3.82z"/>
 </svg>
 `.trim();
+
+// OIDC 元数据内存缓存，避免每次用户点击都发起额外的发现请求
+let oidcConfigCache = null;
+let oidcConfigCacheTime = 0;
+let cachedIssuer = '';
+
+/**
+ * 规范化主域名 / Issuer URL
+ * @param {string} raw
+ * @returns {string}
+ */
+function normalizeIssuer(raw) {
+    let str = String(raw || DEFAULT_ISSUER).trim();
+    if (!str.startsWith('http://') && !str.startsWith('https://')) {
+        str = `https://${str}`;
+    }
+    return str.replace(/\/+$/, '');
+}
+
+/**
+ * 通过 OIDC 发现端点获取或解析标准端点地址
+ * @param {any} superagent
+ * @param {string} rawIssuer
+ * @returns {Promise<{ authorization_endpoint: string, token_endpoint: string, userinfo_endpoint: string }>}
+ */
+async function getOidcEndpoints(superagent, rawIssuer) {
+    const issuer = normalizeIssuer(rawIssuer);
+    const now = Date.now();
+
+    // 缓存有效期 1 小时，且当配置的主域名发生变更时自动失效重新发现
+    if (oidcConfigCache && cachedIssuer === issuer && (now - oidcConfigCacheTime < 3600000)) {
+        return oidcConfigCache;
+    }
+
+    const discoveryUrl = `${issuer}/.well-known/openid-configuration`;
+    try {
+        const res = await superagent
+            .get(discoveryUrl)
+            .timeout({ response: 5000, deadline: 8000 })
+            .set('Accept', 'application/json');
+
+        if (res.body && res.body.authorization_endpoint && res.body.token_endpoint) {
+            oidcConfigCache = {
+                authorization_endpoint: res.body.authorization_endpoint,
+                token_endpoint: res.body.token_endpoint,
+                userinfo_endpoint: res.body.userinfo_endpoint || `${issuer}/v2/oauth/userinfo`,
+            };
+            oidcConfigCacheTime = now;
+            cachedIssuer = issuer;
+            return oidcConfigCache;
+        }
+    } catch (err) {
+        // 当发现接口临时网络异常或无法访问时，优雅降级为 OIDC 标准默认路径
+    }
+
+    // 降级兜底方案
+    return {
+        authorization_endpoint: `${issuer}/v2/oauth/authorize`,
+        token_endpoint: `${issuer}/v2/oauth/token`,
+        userinfo_endpoint: `${issuer}/v2/oauth/userinfo`,
+    };
+}
 
 /**
  * 插件入口 apply 函数 (Cordis 微内核)
@@ -45,9 +106,35 @@ function apply(ctx) {
         superagent,
     } = require('hydrooj');
 
+    /**
+     * 统一解析当前生效的端点（支持自动发现与手动单项覆盖）
+     */
+    async function resolveEndpoints() {
+        const issuer = (await SystemModel.get('suseoaa.issuer')) || DEFAULT_ISSUER;
+        const oidc = await getOidcEndpoints(superagent, issuer);
+
+        const customAuth = (await SystemModel.get('suseoaa.authorize_url')) || '';
+        const customToken = (await SystemModel.get('suseoaa.token_url')) || '';
+        const customUserinfo = (await SystemModel.get('suseoaa.userinfo_url')) || '';
+
+        return {
+            authorizeUrl: customAuth.trim() || oidc.authorization_endpoint,
+            tokenUrl: customToken.trim() || oidc.token_endpoint,
+            userinfoUrl: customUserinfo.trim() || oidc.userinfo_endpoint,
+        };
+    }
+
     // 1. 注入后台系统配置（严格指定类型为 'text'，严禁使用 'string'）
     ctx.inject(['setting'], (c) => {
         const settings = [
+            SettingModel.Setting(
+                'SUSE OAA',
+                'suseoaa.issuer',
+                DEFAULT_ISSUER,
+                'text',
+                '统一认证主域名 (Issuer)',
+                '认证中心根地址（填入主域名如 https://v2-api.suseoaa.com 即可，插件会自动通过 OIDC Discovery 发现所有端点）'
+            ),
             SettingModel.Setting(
                 'SUSE OAA',
                 'suseoaa.client_id',
@@ -67,35 +154,11 @@ function apply(ctx) {
             ),
             SettingModel.Setting(
                 'SUSE OAA',
-                'suseoaa.authorize_url',
-                DEFAULT_AUTH_URL,
-                'text',
-                'Authorize URL',
-                '统一身份认证授权跳转端点'
-            ),
-            SettingModel.Setting(
-                'SUSE OAA',
-                'suseoaa.token_url',
-                DEFAULT_TOKEN_URL,
-                'text',
-                'Token URL',
-                'OAuth2 换取访问令牌端点'
-            ),
-            SettingModel.Setting(
-                'SUSE OAA',
-                'suseoaa.userinfo_url',
-                DEFAULT_USERINFO_URL,
-                'text',
-                'UserInfo URL',
-                'OAuth2 拉取用户信息端点'
-            ),
-            SettingModel.Setting(
-                'SUSE OAA',
                 'suseoaa.scope',
                 DEFAULT_SCOPE,
                 'text',
                 'Scope',
-                'OAuth2 申请权限范围 (空格分隔)'
+                'OAuth2 申请权限范围 (空格分隔，默认 openid profile email)'
             ),
             SettingModel.Setting(
                 'SUSE OAA',
@@ -104,6 +167,31 @@ function apply(ctx) {
                 'text',
                 '静默自动开号 (true/false)',
                 '首次认证且无绑定用户时，是否自动创建账号并一键进入系统（填 true 或 false）'
+            ),
+            // 以下端点默认为空即可，插件全自动发现；仅在特殊调试或网关代理时供覆盖使用
+            SettingModel.Setting(
+                'SUSE OAA',
+                'suseoaa.authorize_url',
+                '',
+                'text',
+                '【高级选填】自定义 Authorize URL',
+                '默认留空即可自动发现；若填写则覆盖自动发现的授权跳转端点'
+            ),
+            SettingModel.Setting(
+                'SUSE OAA',
+                'suseoaa.token_url',
+                '',
+                'text',
+                '【高级选填】自定义 Token URL',
+                '默认留空即可自动发现；若填写则覆盖自动发现的换取访问令牌端点'
+            ),
+            SettingModel.Setting(
+                'SUSE OAA',
+                'suseoaa.userinfo_url',
+                '',
+                'text',
+                '【高级选填】自定义 UserInfo URL',
+                '默认留空即可自动发现；若填写则覆盖自动发现的用户信息端点'
             ),
         ];
 
@@ -127,12 +215,12 @@ function apply(ctx) {
              * this 指向 Hydro 的 Handler 实例
              */
             get: async function get() {
-                // 读取当前配置（支持管理后台动态热修改）
+                // 1. 读取客户端配置与动态发现的端点
                 const clientId = (await SystemModel.get('suseoaa.client_id')) || DEFAULT_CLIENT_ID;
-                const authorizeUrl = (await SystemModel.get('suseoaa.authorize_url')) || DEFAULT_AUTH_URL;
                 const scope = (await SystemModel.get('suseoaa.scope')) || DEFAULT_SCOPE;
+                const { authorizeUrl } = await resolveEndpoints();
 
-                // 确定重定向回溯地址与 callback 地址
+                // 2. 确定重定向回溯地址与 callback 地址
                 let serverUrl = (await SystemModel.get('server.url')) || '';
                 if (!serverUrl) {
                     const protocol = this.request.protocol || 'http';
@@ -142,16 +230,16 @@ function apply(ctx) {
                 const normalizedServerUrl = serverUrl.endsWith('/') ? serverUrl : `${serverUrl}/`;
                 const redirectUri = `${normalizedServerUrl}oauth/${PROVIDER_NAME}/callback`;
 
-                // 记录用户发起登录前的原始目标页面
+                // 3. 记录用户发起登录前的原始目标页面
                 const originRedirect = this.session.oauthRedirect || this.request.query?.redirect || this.request.referer || '/';
 
-                // 生成防 CSRF 重放的 state 临时令牌，有效期 600 秒
+                // 4. 生成防 CSRF 重放的 state 临时令牌，有效期 600 秒
                 const [state] = await TokenModel.add(TokenModel.TYPE_OAUTH, 600, {
                     redirect: originRedirect,
                     redirectUri,
                 });
 
-                // 构造跳转 URL
+                // 5. 构造跳转 URL
                 const queryParams = new URLSearchParams({
                     response_type: 'code',
                     client_id: clientId,
@@ -196,13 +284,12 @@ function apply(ctx) {
                 // 销毁已消费的 State
                 await TokenModel.del(s._id, TokenModel.TYPE_OAUTH);
 
-                // 读取最新系统配置
+                // 读取配置与端点
                 const clientId = (await SystemModel.get('suseoaa.client_id')) || DEFAULT_CLIENT_ID;
                 const clientSecret = (await SystemModel.get('suseoaa.client_secret')) || DEFAULT_CLIENT_SECRET;
-                const tokenUrl = (await SystemModel.get('suseoaa.token_url')) || DEFAULT_TOKEN_URL;
-                const userinfoUrl = (await SystemModel.get('suseoaa.userinfo_url')) || DEFAULT_USERINFO_URL;
                 const autoRegisterConfig = (await SystemModel.get('suseoaa.auto_register')) ?? 'true';
                 const isAutoRegister = String(autoRegisterConfig).trim().toLowerCase() !== 'false';
+                const { tokenUrl, userinfoUrl } = await resolveEndpoints();
 
                 // 确保使用与发起授权时完全一致的 redirect_uri
                 let redirectUri = s.redirectUri;
@@ -375,7 +462,7 @@ function apply(ctx) {
                         }
 
                         // 关键：将所有识别 ID 写入 oauth 映射集合中
-                        // 这样 Hydro 的 OauthCallbackHandler 在本函数返回后会立即匹配到 effectiveUid，直接触发 successfulAuth 登录并跳转
+                        // 这样 Hydro 的 OauthCallbackHandler 在本函数返回后会立即匹配到 targetUid，直接触发 successfulAuth 登录并跳转
                         await Promise.all(
                             ids.map((id) => this.ctx.oauth.set(PROVIDER_NAME, id, targetUid))
                         );
