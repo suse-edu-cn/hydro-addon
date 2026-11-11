@@ -1,0 +1,26 @@
+{
+  "name": "hydro-addon",
+  "version": "1.0.0",
+  "description": "SUSE OAA Unified Identity Authentication (SSO) native Addon for Hydro OJ v5.x",
+  "main": "index.js",
+  "scripts": {
+    "test": "node -c index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/suse-edu-cn/hydro-addon.git"
+  },
+  "keywords": [
+    "hydrooj",
+    "addon",
+    "sso",
+    "oauth2",
+    "oidc",
+    "suse-oaa"
+  ],
+  "author": "SUSE",
+  "license": "MIT",
+  "peerDependencies": {
+    "hydrooj": ">=5.0.0"
+  }
+}
