@@ -3,11 +3,12 @@
  * 
  * 功能特性：
  * 1. 支持标准 OIDC Discovery 协议：只需填写主域名（Issuer），插件全自动通过 /.well-known/openid-configuration 发现授权、令牌、用户信息端点；
- * 2. 原生注册 OAuth2 / OIDC 提供者（suseoaa），在登录弹窗与 /login 页面原生渲染「OAA统一身份认证」大按钮；
- * 3. 自动生成并校验防重放安全 State 令牌（TokenModel.TYPE_OAUTH）；
- * 4. 换取访问令牌并拉取 OAA 用户信息（姓名、学号、邮箱、唯一 sub）；
- * 5. 支持「一键秒进首页」静默无感自动开号与账号绑定，自动补齐 PRIV_USER_PROFILE 权限；
- * 6. 后台控制面板配置项注入（严格使用 'text' 规范类型，防止 HTML 模板报错）。
+ * 2. 动态自适应补齐绝对公网回调地址（强制纠正 Hydro 默认 server.url 为 '/' 导致的相对路径问题）；
+ * 3. 原生注册 OAuth2 / OIDC 提供者（suseoaa），在登录弹窗与 /login 页面原生渲染「OAA统一身份认证」大按钮；
+ * 4. 自动生成并校验防重放安全 State 令牌（TokenModel.TYPE_OAUTH）；
+ * 5. 换取访问令牌并拉取 OAA 用户信息（姓名、学号、邮箱、唯一 sub）；
+ * 6. 支持「一键秒进首页」静默无感自动开号与账号绑定，自动补齐 PRIV_USER_PROFILE 权限；
+ * 7. 后台控制面板配置项注入（严格使用 'text' 规范类型，防止 HTML 模板报错）。
  */
 
 const crypto = require('crypto');
@@ -43,6 +44,29 @@ function normalizeIssuer(raw) {
         str = `https://${str}`;
     }
     return str.replace(/\/+$/, '');
+}
+
+/**
+ * 提取并构造合法的绝对路径 Server URL（保证包含协议和主机名，杜绝 OAuth 重定向 URI 为相对路径）
+ * @param {any} handler Hydro Handler 实例
+ * @param {string} configuredUrl 从 SystemModel.get('server.url') 取到的配置
+ * @returns {string} 例如 "https://oj.suse.edu.cn/"
+ */
+function getAbsoluteServerUrl(handler, configuredUrl) {
+    let url = String(configuredUrl || '').trim();
+    // Hydro 默认初始值为 '/'，或者管理员未填入 http 开头的完整域名
+    if (!url || url === '/' || !url.startsWith('http')) {
+        const headers = handler.request?.header || {};
+        const proto = headers['x-forwarded-proto']
+            || handler.request?.protocol
+            || 'http';
+        const host = headers['x-forwarded-host']
+            || headers.host
+            || handler.request?.host
+            || 'localhost';
+        url = `${proto}://${host}/`;
+    }
+    return url.endsWith('/') ? url : `${url}/`;
 }
 
 /**
@@ -133,7 +157,7 @@ function apply(ctx) {
                 DEFAULT_ISSUER,
                 'text',
                 '统一认证主域名 (Issuer)',
-                '认证中心根地址（填入主域名如 https://v2-api.suseoaa.com 即可，插件会自动通过 OIDC Discovery 发现所有端点）'
+                '认证中心根地址（填入主域名如 https://v2-api.suseoaa.com 即可，自动通过 OIDC Discovery 发现端点）'
             ),
             SettingModel.Setting(
                 'SUSE OAA',
@@ -158,7 +182,7 @@ function apply(ctx) {
                 DEFAULT_SCOPE,
                 'text',
                 'Scope',
-                'OAuth2 申请权限范围 (空格分隔，默认 openid profile email)'
+                'OAuth2 申请权限范围 (空格分隔)'
             ),
             SettingModel.Setting(
                 'SUSE OAA',
@@ -168,14 +192,13 @@ function apply(ctx) {
                 '静默自动开号 (true/false)',
                 '首次认证且无绑定用户时，是否自动创建账号并一键进入系统（填 true 或 false）'
             ),
-            // 以下端点默认为空即可，插件全自动发现；仅在特殊调试或网关代理时供覆盖使用
             SettingModel.Setting(
                 'SUSE OAA',
                 'suseoaa.authorize_url',
                 '',
                 'text',
                 '【高级选填】自定义 Authorize URL',
-                '默认留空即可自动发现；若填写则覆盖自动发现的授权跳转端点'
+                '默认留空即可自动发现；若填写则覆盖自动发现的授权端点'
             ),
             SettingModel.Setting(
                 'SUSE OAA',
@@ -183,7 +206,7 @@ function apply(ctx) {
                 '',
                 'text',
                 '【高级选填】自定义 Token URL',
-                '默认留空即可自动发现；若填写则覆盖自动发现的换取访问令牌端点'
+                '默认留空即可自动发现；若填写则覆盖自动发现的令牌端点'
             ),
             SettingModel.Setting(
                 'SUSE OAA',
@@ -210,25 +233,16 @@ function apply(ctx) {
             icon: ICON_GRADUATION_CAP,
             canRegister: true,
 
-            /**
-             * 发起跳转至 OAA 认证中心
-             * this 指向 Hydro 的 Handler 实例
-             */
             get: async function get() {
                 // 1. 读取客户端配置与动态发现的端点
                 const clientId = (await SystemModel.get('suseoaa.client_id')) || DEFAULT_CLIENT_ID;
                 const scope = (await SystemModel.get('suseoaa.scope')) || DEFAULT_SCOPE;
                 const { authorizeUrl } = await resolveEndpoints();
 
-                // 2. 确定重定向回溯地址与 callback 地址
-                let serverUrl = (await SystemModel.get('server.url')) || '';
-                if (!serverUrl) {
-                    const protocol = this.request.protocol || 'http';
-                    const host = this.request.host || 'localhost';
-                    serverUrl = `${protocol}://${host}/`;
-                }
-                const normalizedServerUrl = serverUrl.endsWith('/') ? serverUrl : `${serverUrl}/`;
-                const redirectUri = `${normalizedServerUrl}oauth/${PROVIDER_NAME}/callback`;
+                // 2. 严格生成合法的绝对公网回跳地址 redirect_uri
+                const configuredServerUrl = await SystemModel.get('server.url');
+                const serverUrl = getAbsoluteServerUrl(this, configuredServerUrl);
+                const redirectUri = `${serverUrl}oauth/${PROVIDER_NAME}/callback`;
 
                 // 3. 记录用户发起登录前的原始目标页面
                 const originRedirect = this.session.oauthRedirect || this.request.query?.redirect || this.request.referer || '/';
@@ -252,11 +266,6 @@ function apply(ctx) {
                 this.response.redirect = target;
             },
 
-            /**
-             * 处理统一认证中心授权回调
-             * @param {Record<string, any>} args 回调参数集合
-             * this 指向 Hydro 的 Handler 实例
-             */
             callback: async function callback(args = {}) {
                 const query = this.request.query || {};
                 const code = args.code || query.code;
@@ -264,7 +273,6 @@ function apply(ctx) {
                 const error = args.error || query.error;
                 const errorDescription = args.error_description || query.error_description;
 
-                // 异常响应校验
                 if (error) {
                     throw new UserFacingError(errorDescription || `统一身份认证授权失败: ${error}`);
                 }
@@ -275,36 +283,27 @@ function apply(ctx) {
                     throw new ValidationError('state', '授权回调缺少 state 参数');
                 }
 
-                // 校验 State 防跨站重放攻击
                 const s = await TokenModel.get(state, TokenModel.TYPE_OAUTH);
                 if (!s) {
                     throw new ValidationError('token', '认证状态已失效或已过期，请重新点击登录');
                 }
 
-                // 销毁已消费的 State
                 await TokenModel.del(s._id, TokenModel.TYPE_OAUTH);
 
-                // 读取配置与端点
                 const clientId = (await SystemModel.get('suseoaa.client_id')) || DEFAULT_CLIENT_ID;
                 const clientSecret = (await SystemModel.get('suseoaa.client_secret')) || DEFAULT_CLIENT_SECRET;
                 const autoRegisterConfig = (await SystemModel.get('suseoaa.auto_register')) ?? 'true';
                 const isAutoRegister = String(autoRegisterConfig).trim().toLowerCase() !== 'false';
                 const { tokenUrl, userinfoUrl } = await resolveEndpoints();
 
-                // 确保使用与发起授权时完全一致的 redirect_uri
+                // 严格保证使用与发起授权时完全一致的绝对 redirect_uri
                 let redirectUri = s.redirectUri;
-                if (!redirectUri) {
-                    let serverUrl = (await SystemModel.get('server.url')) || '';
-                    if (!serverUrl) {
-                        const protocol = this.request.protocol || 'http';
-                        const host = this.request.host || 'localhost';
-                        serverUrl = `${protocol}://${host}/`;
-                    }
-                    const normalizedServerUrl = serverUrl.endsWith('/') ? serverUrl : `${serverUrl}/`;
-                    redirectUri = `${normalizedServerUrl}oauth/${PROVIDER_NAME}/callback`;
+                if (!redirectUri || !redirectUri.startsWith('http')) {
+                    const configuredServerUrl = await SystemModel.get('server.url');
+                    const serverUrl = getAbsoluteServerUrl(this, configuredServerUrl);
+                    redirectUri = `${serverUrl}oauth/${PROVIDER_NAME}/callback`;
                 }
 
-                // 1. 换取访问令牌 Access Token
                 let accessToken = '';
                 try {
                     const tokenRes = await superagent
@@ -333,7 +332,6 @@ function apply(ctx) {
                     throw new UserFacingError(`换取访问令牌失败: ${err.message || err}`);
                 }
 
-                // 2. 拉取统一认证中心用户信息
                 let userinfo = null;
                 try {
                     const userinfoRes = await superagent
@@ -351,42 +349,33 @@ function apply(ctx) {
                     throw new UserFacingError(`获取用户身份信息失败: ${err.message || err}`);
                 }
 
-                // 3. 数据规范化与兜底降级处理
                 const sub = userinfo.sub ? String(userinfo.sub).trim() : '';
                 const studentId = userinfo.student_id ? String(userinfo.student_id).trim() : '';
                 const rawName = userinfo.name ? String(userinfo.name).trim() : '';
-                // 邮箱兜底策略：若未返回邮箱，以学号或 sub 构造校内标准邮箱格式
                 const email = userinfo.email
                     ? String(userinfo.email).trim()
                     : (studentId ? `${studentId}@suse.edu.cn` : `${sub || 'user'}@suse.edu.cn`);
                 const displayName = rawName || studentId || (sub ? `user_${sub}` : 'SUSE_User');
 
-                // 提取唯一识别 ID 列表，用于多重精准绑定
                 const ids = [sub, studentId, email].filter(Boolean);
 
-                // 4. 实现免二次确认密码的「一键秒进首页」静默开号与绑定机制
                 if (isAutoRegister) {
-                    // 查询是否已经绑定过本地 uid
                     const existingUids = await Promise.all(
                         ids.map((id) => this.ctx.oauth.get(PROVIDER_NAME, id))
                     );
                     let targetUid = existingUids.find(Boolean);
 
-                    // 若未绑定第三方映射，检查 Hydro 本地是否已存在同邮箱账号进行关联
                     if (!targetUid && email) {
                         const existingByEmail = await UserModel.getByEmail('system', email);
                         if (existingByEmail) {
                             targetUid = existingByEmail._id;
-                            // 补齐所有凭据的 oauth 关联
                             await Promise.all(
                                 ids.map((id) => this.ctx.oauth.set(PROVIDER_NAME, id, targetUid))
                             );
                         }
                     }
 
-                    // 若完全无账号，则直接在 Hydro 中创建原生新用户
                     if (!targetUid) {
-                        // 候选用户名尝试列表
                         const candidateUnames = [
                             displayName,
                             studentId,
@@ -405,7 +394,6 @@ function apply(ctx) {
                             }
                         }
 
-                        // 若候选用户名均已被占用，添加简短随机后缀
                         if (!finalUname) {
                             const baseUname = (displayName || studentId || 'user').trim();
                             for (let i = 0; i < 5; i++) {
@@ -421,12 +409,10 @@ function apply(ctx) {
                             }
                         }
 
-                        // 关键系统权限机制：保证拥有 PRIV_USER_PROFILE (= 4)，避免被降级为 guest 清除 session
                         const defaultPriv = (await SystemModel.get('default.priv')) || 0;
                         const privUserProfile = (PRIV && PRIV.PRIV_USER_PROFILE) ? Number(PRIV.PRIV_USER_PROFILE) : 4;
                         const finalPriv = Number(defaultPriv) | privUserProfile;
 
-                        // 生成高强度安全随机初始密码（单点登录用户无需使用该密码）
                         const randomPassword = crypto.randomBytes(18).toString('base64');
                         const clientIp = this.request.ip || '127.0.0.1';
 
@@ -440,7 +426,6 @@ function apply(ctx) {
                                 finalPriv
                             );
 
-                            // 补充用户附加元数据（显示名称 / 学号等）
                             const extraMeta = {};
                             if (displayName && displayName !== finalUname) {
                                 extraMeta.displayName = displayName;
@@ -452,7 +437,6 @@ function apply(ctx) {
                                 await UserModel.setById(targetUid, extraMeta);
                             }
                         } catch (createErr) {
-                            // 防并发或微小几率重复冲突：若创建抛错，尝试重新按邮箱匹配
                             const fallbackUser = await UserModel.getByEmail('system', email);
                             if (fallbackUser) {
                                 targetUid = fallbackUser._id;
@@ -461,15 +445,12 @@ function apply(ctx) {
                             }
                         }
 
-                        // 关键：将所有识别 ID 写入 oauth 映射集合中
-                        // 这样 Hydro 的 OauthCallbackHandler 在本函数返回后会立即匹配到 targetUid，直接触发 successfulAuth 登录并跳转
                         await Promise.all(
                             ids.map((id) => this.ctx.oauth.set(PROVIDER_NAME, id, targetUid))
                         );
                     }
                 }
 
-                // 5. 返回符合 Hydro 规范的 OAuthUserResponse 对象
                 return {
                     _id: ids,
                     email,
@@ -480,7 +461,6 @@ function apply(ctx) {
         });
     });
 
-    // 3. 加载本地化文本
     if (ctx.i18n && typeof ctx.i18n.load === 'function') {
         ctx.i18n.load('zh', {
             'OAA统一身份认证': 'OAA统一身份认证',
